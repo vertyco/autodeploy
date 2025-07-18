@@ -12,7 +12,7 @@ from utils import Const, LogFormatter, PrettyFormatter, Tools
 # Config setup
 parser = ConfigParser()
 # Log setup
-log = logging.getLogger("arkparser")
+log = logging.getLogger("autodeploy")
 # Console logs
 console = logging.StreamHandler()
 console.setFormatter(PrettyFormatter())
