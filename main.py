@@ -1,18 +1,14 @@
-import hashlib
+"""Compile with 'pyinstaller.exe --clean app.spec'"""
+
 import logging
 import os
 import sys
-import time
 from configparser import ConfigParser
-from contextlib import suppress
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 
 from watchdog.events import (
-    FileCreatedEvent,
-    FileDeletedEvent,
     FileModifiedEvent,
-    FileMovedEvent,
     FileSystemEvent,
     FileSystemEventHandler,
 )
@@ -20,9 +16,8 @@ from watchdog.observers import Observer
 
 from utils import Const, LogFormatter, PrettyFormatter, Tools
 
-IS_WINDOWS: bool = sys.platform.startswith("win")
 IS_EXE = True if (getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")) else False
-if IS_EXE and IS_WINDOWS:
+if IS_EXE:
     ROOT_DIR = Path(os.path.dirname(os.path.abspath(sys.executable)))
 else:
     ROOT_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent
@@ -47,25 +42,16 @@ def setup_logging():
     log.addHandler(file)
 
 
-def file_hash(path: Path | str, algo="sha256") -> str:
-    """Compute the hash of a file."""
-    h = hashlib.new(algo)
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 class CustomEventHandler(FileSystemEventHandler):
     def __init__(self, target_file: Path, target_process: str):
         super().__init__()
         self.target_file = target_file
         self.target_process = target_process
-        self._debounce_time = (
-            0.03  # To prevent duplicate events when editors call the save kernel twice
-        )
+
+        # To prevent duplicate events when editors call the save kernel twice
+        self._debounce_time = 5
         self._last_events: dict[str, float] = {}
-        self._target_hash = file_hash(self.target_file)
+        self._target_hash = Tools.file_hash(self.target_file)
 
     def _is_duplicate_event(self, event: FileSystemEvent) -> bool:
         """
@@ -79,7 +65,7 @@ class CustomEventHandler(FileSystemEventHandler):
             else event.src_path
         )
         event_key = f"{os.path.basename(path)}:{type(event).__name__}"
-        log.debug(event)
+        # log.debug(event)
         current_time = perf_counter()
         last_event_time = self._last_events.get(event_key, 0)
         delta = current_time - last_event_time
@@ -89,22 +75,93 @@ class CustomEventHandler(FileSystemEventHandler):
             )
             return True
         self._last_events[event_key] = current_time
-        log.debug("---")
+        # log.debug("---")
         return False
 
     def on_modified(self, event: FileModifiedEvent) -> None:
         if self._is_duplicate_event(event):
             return
 
-        log.info(f"{self.target_file.name} was modified!")
+        # Make sure file names match
+        if Path(event.src_path).name != self.target_file.name:
+            return
+
+        log.info(f"{self.target_file.name} was modified, comparing hashes")
+        Tools.wait_until_file_lock_released(event.src_path)
+
+        self.do_update(Path(event.src_path))
+
+    def do_update(self, source_path: Path) -> None:
+        # Compare file hashes
+        if Tools.file_hash(source_path) == self._target_hash:
+            log.info("File hash matches, no action needed.")
+            return
+
+        log.info("File hash does not match, updating target file!")
+        if Tools.is_running(self.target_process):
+            log.info(f"Killing {self.target_process} process")
+            Tools.kill(self.target_process)
+            sleep(5)
+
+        if "arkview" in self.target_process.lower():
+            Tools.kill("ASVExport.exe")
+
+        tmp_path = self.target_file.parent / f"{self.target_file.stem}.tmp"
+        try:
+            with open(source_path, "rb") as src_file:
+                with open(tmp_path, "wb") as target_file:
+                    target_file.write(src_file.read())
+                    target_file.flush()
+                    os.fsync(target_file.fileno())
+
+            tries = 0
+            while tries < 10:
+                tries += 1
+                try:
+                    self.target_file.unlink(missing_ok=True)
+                    break
+                except PermissionError:
+                    log.debug("Something is accessing the target file, waiting...")
+                    Tools.kill(self.target_process)
+                    sleep(3)
+
+            tmp_path.rename(self.target_file)
+
+            if o_dir := getattr(os, "O_DIRECTORY", None):
+                fd = os.open(self.target_file.parent, o_dir)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        except Exception as e:
+            log.error(f"Failed to read source file {source_path}", exc_info=e)
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception as e:
+                    log.error(f"Failed to remove temporary file {tmp_path}", exc_info=e)
+
+        # Now we need to restart the process
+        if (
+            not Tools.is_running(self.target_process)
+            and "arkwipe" not in str(self.target_file).lower()
+            and self.target_file.name.endswith(".exe")
+        ):
+            if Tools.is_unc_path(self.target_file):
+                log.warning("Target file is on a UNC path, cannot start process.")
+            else:
+                log.info(f"Starting {self.target_process} process back up")
+                current_dir = os.getcwd()
+                os.chdir(self.target_file.parent)
+                os.system(f"start /MIN {self.target_file.name}")
+                os.chdir(current_dir)
+
+        log.info(f"Updated {self.target_file.name} successfully!")
+        self._target_hash = Tools.file_hash(self.target_file)
 
 
 class AutoDeploy:
-    """Compile with 'pyinstaller.exe --clean app.spec'"""
-
     def __init__(self):
-        self.cwd = os.getcwd()
-
         self.observer = Observer()
 
     def run(self):
@@ -141,17 +198,20 @@ class AutoDeploy:
             if not target.is_file():
                 log.error(f"Target for {app_name} is not a file!")
                 continue
+            target.parent.mkdir(parents=True, exist_ok=True)
 
-            handler = CustomEventHandler(
-                target_file=target, target_process=process_name
-            )
-            self.observer.schedule(handler, path=source.parent, recursive=False)
             log.info(f"Watching {source} for changes...")
+            handler = CustomEventHandler(
+                target_file=target,
+                target_process=process_name,
+            )
+            handler.do_update(source)
+            self.observer.schedule(handler, path=source.parent, recursive=False)
 
         self.observer.start()
         try:
             while True:
-                time.sleep(0.5)
+                sleep(1)
         finally:
             self.observer.stop()
             self.observer.join()
@@ -163,4 +223,4 @@ if __name__ == "__main__":
         AutoDeploy().run()
     except Exception as e:
         log.error("An error occurred during deployment", exc_info=e)
-        # input("Press any key to exit")
+        input("Press any key to exit")
