@@ -1,3 +1,4 @@
+import ctypes
 import hashlib
 import logging
 import os
@@ -7,6 +8,56 @@ from pathlib import Path
 from time import perf_counter, sleep
 
 log = logging.getLogger("autodeploy.utils")
+
+IS_WINDOWS = os.name == "nt"
+
+
+def disable_quickedit() -> None:
+    """Turn off QuickEdit on the Windows console.
+
+    QuickEdit pauses every stdout write while a user click holds the console
+    in selection mode -- that pause blocks the polling loop and freezes
+    deployments until the selection is cleared. This is the most likely
+    "it silently stopped" failure for a minimized console. No-op off Windows.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        std_input_handle = ctypes.c_ulong(-10)
+        enable_quick_edit = 0x0040
+        enable_extended_flags = 0x0080
+        handle = kernel32.GetStdHandle(std_input_handle)
+        mode = ctypes.c_ulong()
+        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+        mode.value &= ~enable_quick_edit
+        mode.value |= enable_extended_flags
+        kernel32.SetConsoleMode(handle, mode)
+    except (OSError, AttributeError) as exc:
+        log.debug("disable_quickedit failed: %s", exc)
+
+
+def enable_console_vt() -> None:
+    """Enable ANSI VT escape processing on the Windows console.
+
+    Win10+ supports VT but the flag is off by default for fresh consoles
+    (PyInstaller exes); without it the color codes render as literal text.
+    No-op off Windows.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        enable_vt = 0x0004
+        enable_processed = 0x0001
+        for handle_id in (ctypes.c_ulong(-11), ctypes.c_ulong(-12)):  # stdout, stderr
+            h = kernel32.GetStdHandle(handle_id)
+            mode = ctypes.c_ulong()
+            if not kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+                continue
+            kernel32.SetConsoleMode(h, mode.value | enable_vt | enable_processed)
+    except (OSError, AttributeError) as exc:
+        log.debug("enable_console_vt failed: %s", exc)
 
 
 class LogFormatter(logging.Formatter):
@@ -99,33 +150,67 @@ class Tools:
             return False
 
     @staticmethod
-    def file_hash(path: Path | str, algo="sha256") -> str:
-        """Compute the hash of a file."""
+    def tail_signature(
+        path: Path | str, tail_bytes: int = 131072, algo: str = "sha256"
+    ) -> tuple[int, str] | None:
+        """Cheap change signature: ``(size, hash of the last tail_bytes)``.
+
+        Avoids streaming the whole file over the network on every poll. For a
+        PyInstaller one-file exe the bootloader stub at the head is identical
+        across rebuilds, while the appended CArchive (PYZ + data + TOC + the
+        24-byte MEI cookie) lives at the tail -- so any rebuild changes the tail
+        and/or the size. mtime is intentionally not consulted (unreliable over
+        SMB). Returns ``None`` if the file can't be read.
+        """
         try:
+            size = os.path.getsize(path)
             h = hashlib.new(algo)
             with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(8192), b""):
-                    h.update(chunk)
-            return h.hexdigest()
-        except (IOError, FileNotFoundError):
-            log.error(f"Could not read file for hashing: {path}")
-            return ""
+                if size > tail_bytes:
+                    f.seek(size - tail_bytes)
+                h.update(f.read())
+            return (size, h.hexdigest())
+        except (IOError, OSError):
+            return None
 
     @staticmethod
-    def wait_until_file_lock_released(file_path: Path | str, timeout: int = 60) -> bool:
-        """Wait until the file lock is released."""
-        if not os.path.exists(file_path):
-            return True
-        start_time = perf_counter()
+    def wait_until_stable(
+        path: Path | str,
+        timeout: float = 60.0,
+        poll: float = 0.5,
+        stable_reads: int = 3,
+    ) -> bool:
+        """Wait until a file has finished being written.
+
+        Returns ``True`` once the size is unchanged across ``stable_reads``
+        consecutive polls AND the file opens for reading. The writer is usually
+        on another machine over SMB, where its lock state isn't visible to us --
+        size stability is the reliable signal that the write has stopped.
+        Returns ``False`` on timeout (caller should skip and retry next cycle).
+        """
+        start = perf_counter()
+        last_size = -1
+        streak = 0
         while True:
             try:
-                with open(file_path, "rb"):
-                    return True
-            except (IOError, PermissionError):
-                if perf_counter() - start_time > timeout:
-                    log.error(f"Timeout waiting for file lock on {file_path}")
-                    return False
-            sleep(0.1)
+                size = os.path.getsize(path)
+            except OSError:
+                size = -1
+            if size >= 0 and size == last_size:
+                streak += 1
+                if streak >= stable_reads:
+                    try:
+                        with open(path, "rb"):
+                            return True
+                    except (IOError, OSError):
+                        streak = 0  # still locked by the writer; keep waiting
+            else:
+                streak = 0
+                last_size = size
+            if perf_counter() - start > timeout:
+                log.error(f"Timeout waiting for {path} to stop changing")
+                return False
+            sleep(poll)
 
     @staticmethod
     def is_unc_path(path: Path | str) -> bool:
