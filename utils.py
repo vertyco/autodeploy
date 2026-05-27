@@ -99,17 +99,28 @@ class Tools:
             return False
 
     @staticmethod
-    def file_hash(path: Path | str, algo="sha256") -> str:
-        """Compute the hash of a file."""
+    def tail_signature(
+        path: Path | str, tail_bytes: int = 131072, algo: str = "sha256"
+    ) -> tuple[int, str] | None:
+        """Cheap change signature: ``(size, hash of the last tail_bytes)``.
+
+        Avoids streaming the whole file over the network on every poll. For a
+        PyInstaller one-file exe the bootloader stub at the head is identical
+        across rebuilds, while the appended CArchive (PYZ + data + TOC + the
+        24-byte MEI cookie) lives at the tail -- so any rebuild changes the tail
+        and/or the size. mtime is intentionally not consulted (unreliable over
+        SMB). Returns ``None`` if the file can't be read.
+        """
         try:
+            size = os.path.getsize(path)
             h = hashlib.new(algo)
             with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(8192), b""):
-                    h.update(chunk)
-            return h.hexdigest()
-        except (IOError, FileNotFoundError):
-            log.error(f"Could not read file for hashing: {path}")
-            return ""
+                if size > tail_bytes:
+                    f.seek(size - tail_bytes)
+                h.update(f.read())
+            return (size, h.hexdigest())
+        except (IOError, OSError):
+            return None
 
     @staticmethod
     def wait_until_file_lock_released(file_path: Path | str, timeout: int = 60) -> bool:

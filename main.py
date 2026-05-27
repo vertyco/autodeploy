@@ -40,12 +40,11 @@ def pause_and_exit(message: str = "Press any key to exit") -> None:
 
 class AutoDeploy:
     def __init__(self):
-        self.target_hashes: dict[str, str] = {}  # {path: hash}
-        self.target_meta: dict[str, tuple[float, int]] = {}  # {path: (mtime, size)}
         self.skipped: set[str] = set()
-        self.source_cache: dict[
-            str, tuple[str, float, int]
-        ] = {}  # {path: (hash, mtime, size)}
+        # {target: source signature at last deploy}. A signature is
+        # (size, sha256(tail)) -- see Tools.tail_signature. We trust this
+        # record instead of re-reading the target every cycle.
+        self.deployed_sig: dict[str, tuple[int, str]] = {}
         self.config_mtime: float = 0.0
 
     @classmethod
@@ -162,51 +161,25 @@ class AutoDeploy:
     def check_update(
         self, process_name: str, source: str, target: str, related_processes: list[str]
     ):
-        # --- source hash (metadata-guarded cache) ---
-        try:
-            src_stat = os.stat(source)
-        except OSError:
-            return
-        src_mtime, src_size = src_stat.st_mtime, src_stat.st_size
-        cached_source = self.source_cache.get(source)
-        if cached_source:
-            source_hash, prev_mtime, prev_size = cached_source
-            if prev_mtime != src_mtime or prev_size != src_size:
-                source_hash = Tools.file_hash(source)
-                self.source_cache[source] = (source_hash, src_mtime, src_size)
-        else:
-            source_hash = Tools.file_hash(source)
-            self.source_cache[source] = (source_hash, src_mtime, src_size)
-
-        # --- target hash (metadata-guarded cache) ---
-        try:
-            tgt_stat = os.stat(target)
-            tgt_mtime, tgt_size = tgt_stat.st_mtime, tgt_stat.st_size
-        except OSError:
-            tgt_mtime, tgt_size = 0.0, 0
-        prev_tgt_meta = self.target_meta.get(target)
-        if prev_tgt_meta and prev_tgt_meta == (tgt_mtime, tgt_size):
-            target_hash = self.target_hashes.get(target, "")
-        else:
-            target_hash = Tools.file_hash(target)
-            self.target_hashes[target] = target_hash
-            self.target_meta[target] = (tgt_mtime, tgt_size)
-
-        if not source_hash:
-            # If source hash failed, we can't compare. Skip.
+        # Cheap change signature: (size, hash of the file tail). For a
+        # PyInstaller exe the appended archive + TOC + cookie live at the tail,
+        # so a rebuild changes this without reading the whole file over the
+        # network. mtime is deliberately ignored (unreliable over SMB).
+        source_sig = Tools.tail_signature(source)
+        if source_sig is None:
+            # Source unreadable this cycle; skip and try again next loop.
             return
 
-        if source_hash == target_hash:
-            # File is up-to-date, return
-            return
-
-        # If hashes don't match, but target couldn't be hashed, re-hash it.
-        # This handles cases where the target file was temporarily inaccessible.
-        if not target_hash:
-            target_hash = Tools.file_hash(target)
-            if source_hash == target_hash:
-                self.target_hashes[target] = target_hash
+        known = self.deployed_sig.get(target)
+        if known is None:
+            # First time we've seen this target this run: read the target once
+            # to learn its state, so a restart doesn't redeploy everything.
+            if Tools.tail_signature(target) == source_sig:
+                self.deployed_sig[target] = source_sig
                 return
+        elif known == source_sig:
+            # Already deployed this version; no target read needed.
+            return
 
         Tools.wait_until_file_lock_released(target)
 
@@ -279,13 +252,9 @@ class AutoDeploy:
                 )
 
         log.info(f"Update completed for {process_name}")
-        new_hash = Tools.file_hash(target)
-        self.target_hashes[target] = new_hash
-        try:
-            tgt_stat = os.stat(target)
-            self.target_meta[target] = (tgt_stat.st_mtime, tgt_stat.st_size)
-        except OSError:
-            self.target_meta.pop(target, None)
+        # Target now equals source byte-for-byte, so record the source
+        # signature as deployed -- no need to re-read the target.
+        self.deployed_sig[target] = source_sig
 
 
 if __name__ == "__main__":
