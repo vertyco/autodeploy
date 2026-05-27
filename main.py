@@ -1,116 +1,233 @@
 """Compile with 'pyinstaller.exe --clean app.spec'"""
 
+import csv
 import logging
 import os
+import shutil
+import subprocess
 import sys
 from configparser import ConfigParser
 from pathlib import Path
-from time import perf_counter, sleep
+from time import sleep
 
-from watchdog.events import (
-    FileModifiedEvent,
-    FileSystemEvent,
-    FileSystemEventHandler,
-)
-from watchdog.observers import Observer
+from utils import Const, LogFormatter, SafeRotatingFileHandler, Tools
 
-from utils import Const, LogFormatter, PrettyFormatter, Tools
-
+log = logging.getLogger("autodeploy")
 IS_EXE = True if (getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")) else False
 if IS_EXE:
     ROOT_DIR = Path(os.path.dirname(os.path.abspath(sys.executable)))
 else:
     ROOT_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent
 
+HOSTNAME = os.getenv("COMPUTERNAME") or os.getenv("HOSTNAME")
+CONFIG_PATH = ROOT_DIR / "config.ini"
+PARSER = ConfigParser(interpolation=None)
 
-log = logging.getLogger("autodeploy")
-
-
-def setup_logging():
-    console = logging.StreamHandler()
-    console.setFormatter(PrettyFormatter())
-    log.setLevel(logging.DEBUG)
-    console.setLevel(logging.DEBUG)
-    log.addHandler(console)
-    host = os.getenv("COMPUTERNAME") or os.getenv("HOSTNAME")
-    logpath = ROOT_DIR / ".autodeploy-logs"
-    logpath.mkdir(parents=True, exist_ok=True)
-    logfile = logpath / f"{host}.log"
-    file = logging.FileHandler(logfile, mode="a")
-    file.setFormatter(LogFormatter())
-    file.setLevel(logging.DEBUG)
-    log.addHandler(file)
+red = lambda text: f"\033[91m{text}\033[0m"  # noqa
+blue = lambda text: f"\033[94m{text}\033[0m"  # noqa
+yellow = lambda text: f"\033[93m{text}\033[0m"  # noqa
 
 
-class CustomEventHandler(FileSystemEventHandler):
-    def __init__(self, target_file: Path, target_process: str):
-        super().__init__()
-        self.target_file = target_file
-        self.target_process = target_process
+def pause_and_exit(message: str = "Press any key to exit") -> None:
+    """Wait for a keypress only when running interactively.
 
-        # To prevent duplicate events when editors call the save kernel twice
-        self._debounce_time = 5
-        self._last_events: dict[str, float] = {}
-        self._target_hash = Tools.file_hash(self.target_file)
+    When launched headless (scheduled task, service, no console stdin),
+    ``input()`` would block forever; skip it so the process exits cleanly.
+    """
+    if sys.stdin is not None and sys.stdin.isatty():
+        input(message)
 
-    def _is_duplicate_event(self, event: FileSystemEvent) -> bool:
-        """
-        Check if the event is a duplicate based on the debounce time.
-        Returns True if the event is a duplicate, False otherwise.
-        """
-        # Use a more unique key based on relative path and event type
-        path = (
-            event.dest_path
-            if hasattr(event, "dest_path") and event.dest_path
-            else event.src_path
+
+class AutoDeploy:
+    def __init__(self):
+        self.target_hashes: dict[str, str] = {}  # {path: hash}
+        self.target_meta: dict[str, tuple[float, int]] = {}  # {path: (mtime, size)}
+        self.skipped: set[str] = set()
+        self.source_cache: dict[
+            str, tuple[str, float, int]
+        ] = {}  # {path: (hash, mtime, size)}
+        self.config_mtime: float = 0.0
+
+    @classmethod
+    def run(cls):
+        """Sets up and runs the application."""
+        cls.setup_logging()
+
+        if not CONFIG_PATH.exists():
+            print(red("No config file found!"))
+            with open(CONFIG_PATH, "w") as f:
+                parser = ConfigParser(interpolation=None)
+                parser["Settings"] = Const().defaults
+                parser.write(f)
+            print(yellow("\nPlease update the config file and restart the program."))
+            pause_and_exit()
+            return
+
+        if not HOSTNAME:
+            log.error("Hostname not found!")
+            pause_and_exit()
+            return
+
+        log.info("AutoDeploy service started.")
+        log.info(f"Config file: {CONFIG_PATH}")
+        cls().update_checker()
+
+    @staticmethod
+    def setup_logging():
+        console = logging.StreamHandler()
+        console.setFormatter(LogFormatter())
+        log.setLevel(logging.DEBUG)
+        console.setLevel(logging.DEBUG)
+        log.addHandler(console)
+        log_folder = ROOT_DIR / ".autodeploy-logs"
+        log_file = log_folder / f"{HOSTNAME}.log"
+        os.makedirs(log_folder, exist_ok=True)
+        file = SafeRotatingFileHandler(
+            filename=str(log_file),
+            maxBytes=1_000_000,
+            backupCount=2,
+            encoding="utf-8",
         )
-        event_key = f"{os.path.basename(path)}:{type(event).__name__}"
-        # log.debug(event)
-        current_time = perf_counter()
-        last_event_time = self._last_events.get(event_key, 0)
-        delta = current_time - last_event_time
-        if delta < self._debounce_time:
-            log.debug(
-                f"Ignoring event {type(event)} due to debounce delta {delta:.3f} seconds"
-            )
-            return True
-        self._last_events[event_key] = current_time
-        # log.debug("---")
-        return False
+        file.setFormatter(LogFormatter())
+        file.setLevel(logging.DEBUG)
+        log.addHandler(file)
 
-    def on_modified(self, event: FileModifiedEvent) -> None:
-        if self._is_duplicate_event(event):
-            return
-
-        # Make sure file names match
-        if Path(event.src_path).name != self.target_file.name:
-            return
-
-        log.info(f"{self.target_file.name} was modified, comparing hashes")
-        Tools.wait_until_file_lock_released(event.src_path)
-
-        self.do_update(Path(event.src_path))
-
-    def do_update(self, source_path: Path) -> None:
-        # Compare file hashes
-        if Tools.file_hash(source_path) == self._target_hash:
-            log.info("File hash matches, no action needed.")
-            return
-
-        log.info("File hash does not match, updating target file!")
-        if Tools.is_running(self.target_process):
-            log.info(f"Killing {self.target_process} process")
-            Tools.kill(self.target_process)
+    def update_checker(self):
+        global PARSER
+        while True:
             sleep(5)
+            try:
+                # Only re-parse config when the file has changed
+                try:
+                    cfg_mtime = os.path.getmtime(CONFIG_PATH)
+                except OSError:
+                    cfg_mtime = 0.0
+                if cfg_mtime != self.config_mtime:
+                    # Fresh parser so entries removed from the file stop being
+                    # managed (ConfigParser.read merges, it never deletes keys).
+                    PARSER = ConfigParser(interpolation=None)
+                    PARSER.read(CONFIG_PATH)
+                    self.config_mtime = cfg_mtime
+                settings = PARSER["Settings"]
+                for app_name, paths in settings.items():
+                    try:
+                        # csv parse respects quotes, so paths containing commas
+                        # survive; drop empty fields from stray/trailing commas.
+                        parts = [
+                            p.strip()
+                            for p in next(csv.reader([paths], skipinitialspace=True))
+                            if p.strip()
+                        ]
+                        if len(parts) < 3:
+                            log.error(
+                                f"Skipping {app_name} due to missing parts: {paths}"
+                            )
+                            continue
+                        process_name, source, target = parts[:3]
+                        related_processes = parts[3:]
+                        if not os.path.exists(source):
+                            log.error(f"Source file for {app_name} not found!")
+                            continue
+                        if not os.path.isfile(source):
+                            log.error(f"Source for {app_name} is not a file!")
+                            continue
+                        if os.path.exists(target) and not os.path.isfile(target):
+                            log.error(f"Target for {app_name} is not a file!")
+                            continue
+                        # If the paths parent doesnt exist, skip it
+                        if not os.path.exists(Path(target).parent):
+                            if app_name not in self.skipped:
+                                self.skipped.add(app_name)
+                                log.warning(
+                                    f"Parent directory for {app_name} target file does not exist, skipping."
+                                )
+                            continue
+                        # Parent exists again: re-arm the warning if it vanishes later.
+                        self.skipped.discard(app_name)
+                        os.makedirs(str(Path(target).parent), exist_ok=True)
+                        self.check_update(
+                            process_name, source, target, related_processes
+                        )
+                    except Exception as e:
+                        log.error(f"Error processing {app_name}", exc_info=e)
+                        continue
+            except KeyError:
+                log.error(
+                    "Config file is missing the [Settings] section. Please check."
+                )
+            except Exception as e:
+                log.error("An unexpected error occurred", exc_info=e)
+            sleep(60)
 
-        if "arkview" in self.target_process.lower():
-            Tools.kill("ASVExport.exe")
-
-        tmp_path = self.target_file.parent / f"{self.target_file.stem}.tmp"
+    def check_update(
+        self, process_name: str, source: str, target: str, related_processes: list[str]
+    ):
+        # --- source hash (metadata-guarded cache) ---
         try:
-            with open(source_path, "rb") as src_file:
+            src_stat = os.stat(source)
+        except OSError:
+            return
+        src_mtime, src_size = src_stat.st_mtime, src_stat.st_size
+        cached_source = self.source_cache.get(source)
+        if cached_source:
+            source_hash, prev_mtime, prev_size = cached_source
+            if prev_mtime != src_mtime or prev_size != src_size:
+                source_hash = Tools.file_hash(source)
+                self.source_cache[source] = (source_hash, src_mtime, src_size)
+        else:
+            source_hash = Tools.file_hash(source)
+            self.source_cache[source] = (source_hash, src_mtime, src_size)
+
+        # --- target hash (metadata-guarded cache) ---
+        try:
+            tgt_stat = os.stat(target)
+            tgt_mtime, tgt_size = tgt_stat.st_mtime, tgt_stat.st_size
+        except OSError:
+            tgt_mtime, tgt_size = 0.0, 0
+        prev_tgt_meta = self.target_meta.get(target)
+        if prev_tgt_meta and prev_tgt_meta == (tgt_mtime, tgt_size):
+            target_hash = self.target_hashes.get(target, "")
+        else:
+            target_hash = Tools.file_hash(target)
+            self.target_hashes[target] = target_hash
+            self.target_meta[target] = (tgt_mtime, tgt_size)
+
+        if not source_hash:
+            # If source hash failed, we can't compare. Skip.
+            return
+
+        if source_hash == target_hash:
+            # File is up-to-date, return
+            return
+
+        # If hashes don't match, but target couldn't be hashed, re-hash it.
+        # This handles cases where the target file was temporarily inaccessible.
+        if not target_hash:
+            target_hash = Tools.file_hash(target)
+            if source_hash == target_hash:
+                self.target_hashes[target] = target_hash
+                return
+
+        Tools.wait_until_file_lock_released(target)
+
+        log.info(f"Updating {process_name} from {source}!")
+        if Tools.is_running(process_name):
+            log.info(f"Killing {process_name} process")
+            if Tools.kill(process_name):
+                sleep(5)  # Wait for process to terminate and release handles
+
+        for proc in related_processes:
+            if Tools.is_running(proc):
+                log.info(f"Killing related process {proc}")
+                if Tools.kill(proc):
+                    sleep(1)
+
+        tmp_path = Path(target).with_suffix(".tmp")
+        replaced = False
+        try:
+            with open(source, "rb") as src_file:
                 with open(tmp_path, "wb") as target_file:
-                    target_file.write(src_file.read())
+                    shutil.copyfileobj(src_file, target_file)
                     target_file.flush()
                     os.fsync(target_file.fileno())
 
@@ -118,109 +235,58 @@ class CustomEventHandler(FileSystemEventHandler):
             while tries < 10:
                 tries += 1
                 try:
-                    self.target_file.unlink(missing_ok=True)
+                    os.replace(tmp_path, target)
+                    replaced = True
                     break
-                except PermissionError:
+                except (PermissionError, OSError, IOError):
                     log.debug("Something is accessing the target file, waiting...")
-                    Tools.kill(self.target_process)
+                    # Best-effort: kill the holder if it's our process, then
+                    # always back off. The lock may be held by antivirus or an
+                    # SMB oplock that no kill releases, so the sleep must not be
+                    # conditional on kill succeeding.
+                    Tools.kill(process_name)
                     sleep(3)
 
-            tmp_path.rename(self.target_file)
-
-            if o_dir := getattr(os, "O_DIRECTORY", None):
-                fd = os.open(self.target_file.parent, o_dir)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
         except Exception as e:
-            log.error(f"Failed to read source file {source_path}", exc_info=e)
+            log.error(f"Failed to update {target} from {source}", exc_info=e)
+
+        if not replaced:
+            log.error(
+                f"Could not replace {target} after multiple attempts; will retry next cycle."
+            )
             if tmp_path.exists():
                 try:
                     tmp_path.unlink(missing_ok=True)
                 except Exception as e:
                     log.error(f"Failed to remove temporary file {tmp_path}", exc_info=e)
-
-        # Now we need to restart the process
-        if (
-            not Tools.is_running(self.target_process)
-            and "arkwipe" not in str(self.target_file).lower()
-            and self.target_file.name.endswith(".exe")
-        ):
-            if Tools.is_unc_path(self.target_file):
-                log.warning("Target file is on a UNC path, cannot start process.")
-            else:
-                log.info(f"Starting {self.target_process} process back up")
-                current_dir = os.getcwd()
-                os.chdir(self.target_file.parent)
-                os.system(f"start /MIN {self.target_file.name}")
-                os.chdir(current_dir)
-
-        log.info(f"Updated {self.target_file.name} successfully!")
-        self._target_hash = Tools.file_hash(self.target_file)
-
-
-class AutoDeploy:
-    def __init__(self):
-        self.observer = Observer()
-
-    def run(self):
-        parser = ConfigParser()
-        configpath = Path(os.getcwd()) / "config.ini"
-        if not configpath.exists():
-            log.error("No config file! Making default")
-            with open(configpath, "w") as f:
-                parser["Settings"] = Const().defaults
-                parser.write(f)
-            print("\nPlease update the config file and restart the program.")
-            input("Press any key to exit")
             return
 
-        parser.read(configpath)
-        settings = parser["Settings"]
-        for app_name, paths in settings.items():
-            parts = [i.replace('"', "").strip() for i in paths.split(",")]
-            if len(parts) not in (3, 4):
-                log.error(f"Skipping {app_name} due to missing parts: {paths}")
-                continue
-            if len(parts) == 3:
-                process_name, source_raw, target_raw = parts
+        if (
+            not Tools.is_running(process_name)
+            and "arkwipe" not in str(target).lower()
+            and target.lower().endswith(".exe")
+        ):
+            if Tools.is_unc_path(target):
+                log.warning("Target file is on a UNC path, cannot start process.")
             else:
-                process_name, source_raw, target_raw, _ = parts
+                log.info(f"Starting {Path(target).name} process back up")
+                # Use subprocess.Popen to start the process in its own directory
+                # without changing the current working directory.
+                subprocess.Popen(
+                    [target],
+                    cwd=Path(target).parent,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                )
 
-            source, target = Path(source_raw), Path(target_raw)
-            if not source.exists():
-                log.error(f"Source file for {app_name} not found!")
-                continue
-            if not source.is_file():
-                log.error(f"Source for {app_name} is not a file!")
-                continue
-            if not target.is_file():
-                log.error(f"Target for {app_name} is not a file!")
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-
-            log.info(f"Watching {source} for changes...")
-            handler = CustomEventHandler(
-                target_file=target,
-                target_process=process_name,
-            )
-            handler.do_update(source)
-            self.observer.schedule(handler, path=source.parent, recursive=False)
-
-        self.observer.start()
+        log.info(f"Update completed for {process_name}")
+        new_hash = Tools.file_hash(target)
+        self.target_hashes[target] = new_hash
         try:
-            while True:
-                sleep(1)
-        finally:
-            self.observer.stop()
-            self.observer.join()
+            tgt_stat = os.stat(target)
+            self.target_meta[target] = (tgt_stat.st_mtime, tgt_stat.st_size)
+        except OSError:
+            self.target_meta.pop(target, None)
 
 
 if __name__ == "__main__":
-    setup_logging()
-    try:
-        AutoDeploy().run()
-    except Exception as e:
-        log.error("An error occurred during deployment", exc_info=e)
-        input("Press any key to exit")
+    AutoDeploy.run()
