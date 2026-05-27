@@ -10,7 +10,14 @@ from configparser import ConfigParser
 from pathlib import Path
 from time import sleep
 
-from utils import Const, LogFormatter, SafeRotatingFileHandler, Tools
+from utils import (
+    Const,
+    LogFormatter,
+    SafeRotatingFileHandler,
+    Tools,
+    disable_quickedit,
+    enable_console_vt,
+)
 
 log = logging.getLogger("autodeploy")
 IS_EXE = True if (getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")) else False
@@ -50,6 +57,10 @@ class AutoDeploy:
     @classmethod
     def run(cls):
         """Sets up and runs the application."""
+        # Console init first: stop accidental clicks from pausing the loop,
+        # and make ANSI colors render on a fresh PyInstaller console.
+        disable_quickedit()
+        enable_console_vt()
         cls.setup_logging()
 
         if not CONFIG_PATH.exists():

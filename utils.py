@@ -1,3 +1,4 @@
+import ctypes
 import hashlib
 import logging
 import os
@@ -7,6 +8,56 @@ from pathlib import Path
 from time import perf_counter, sleep
 
 log = logging.getLogger("autodeploy.utils")
+
+IS_WINDOWS = os.name == "nt"
+
+
+def disable_quickedit() -> None:
+    """Turn off QuickEdit on the Windows console.
+
+    QuickEdit pauses every stdout write while a user click holds the console
+    in selection mode -- that pause blocks the polling loop and freezes
+    deployments until the selection is cleared. This is the most likely
+    "it silently stopped" failure for a minimized console. No-op off Windows.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        std_input_handle = ctypes.c_ulong(-10)
+        enable_quick_edit = 0x0040
+        enable_extended_flags = 0x0080
+        handle = kernel32.GetStdHandle(std_input_handle)
+        mode = ctypes.c_ulong()
+        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+        mode.value &= ~enable_quick_edit
+        mode.value |= enable_extended_flags
+        kernel32.SetConsoleMode(handle, mode)
+    except (OSError, AttributeError) as exc:
+        log.debug("disable_quickedit failed: %s", exc)
+
+
+def enable_console_vt() -> None:
+    """Enable ANSI VT escape processing on the Windows console.
+
+    Win10+ supports VT but the flag is off by default for fresh consoles
+    (PyInstaller exes); without it the color codes render as literal text.
+    No-op off Windows.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        enable_vt = 0x0004
+        enable_processed = 0x0001
+        for handle_id in (ctypes.c_ulong(-11), ctypes.c_ulong(-12)):  # stdout, stderr
+            h = kernel32.GetStdHandle(handle_id)
+            mode = ctypes.c_ulong()
+            if not kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+                continue
+            kernel32.SetConsoleMode(h, mode.value | enable_vt | enable_processed)
+    except (OSError, AttributeError) as exc:
+        log.debug("enable_console_vt failed: %s", exc)
 
 
 class LogFormatter(logging.Formatter):
