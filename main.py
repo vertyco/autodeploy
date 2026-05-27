@@ -1,5 +1,6 @@
 """Compile with 'pyinstaller.exe --clean app.spec'"""
 
+import csv
 import logging
 import os
 import shutil
@@ -20,11 +21,21 @@ else:
 
 HOSTNAME = os.getenv("COMPUTERNAME") or os.getenv("HOSTNAME")
 CONFIG_PATH = ROOT_DIR / "config.ini"
-PARSER = ConfigParser()
+PARSER = ConfigParser(interpolation=None)
 
 red = lambda text: f"\033[91m{text}\033[0m"  # noqa
 blue = lambda text: f"\033[94m{text}\033[0m"  # noqa
 yellow = lambda text: f"\033[93m{text}\033[0m"  # noqa
+
+
+def pause_and_exit(message: str = "Press any key to exit") -> None:
+    """Wait for a keypress only when running interactively.
+
+    When launched headless (scheduled task, service, no console stdin),
+    ``input()`` would block forever; skip it so the process exits cleanly.
+    """
+    if sys.stdin is not None and sys.stdin.isatty():
+        input(message)
 
 
 class AutoDeploy:
@@ -45,16 +56,16 @@ class AutoDeploy:
         if not CONFIG_PATH.exists():
             print(red("No config file found!"))
             with open(CONFIG_PATH, "w") as f:
-                parser = ConfigParser()
+                parser = ConfigParser(interpolation=None)
                 parser["Settings"] = Const().defaults
                 parser.write(f)
             print(yellow("\nPlease update the config file and restart the program."))
-            input("Press any key to exit")
+            pause_and_exit()
             return
 
         if not HOSTNAME:
             log.error("Hostname not found!")
-            input("Press any key to exit")
+            pause_and_exit()
             return
 
         log.info("AutoDeploy service started.")
@@ -82,6 +93,7 @@ class AutoDeploy:
         log.addHandler(file)
 
     def update_checker(self):
+        global PARSER
         while True:
             sleep(5)
             try:
@@ -91,12 +103,21 @@ class AutoDeploy:
                 except OSError:
                     cfg_mtime = 0.0
                 if cfg_mtime != self.config_mtime:
+                    # Fresh parser so entries removed from the file stop being
+                    # managed (ConfigParser.read merges, it never deletes keys).
+                    PARSER = ConfigParser(interpolation=None)
                     PARSER.read(CONFIG_PATH)
                     self.config_mtime = cfg_mtime
                 settings = PARSER["Settings"]
                 for app_name, paths in settings.items():
                     try:
-                        parts = [i.replace('"', "").strip() for i in paths.split(",")]
+                        # csv parse respects quotes, so paths containing commas
+                        # survive; drop empty fields from stray/trailing commas.
+                        parts = [
+                            p.strip()
+                            for p in next(csv.reader([paths], skipinitialspace=True))
+                            if p.strip()
+                        ]
                         if len(parts) < 3:
                             log.error(
                                 f"Skipping {app_name} due to missing parts: {paths}"
@@ -121,6 +142,8 @@ class AutoDeploy:
                                     f"Parent directory for {app_name} target file does not exist, skipping."
                                 )
                             continue
+                        # Parent exists again: re-arm the warning if it vanishes later.
+                        self.skipped.discard(app_name)
                         os.makedirs(str(Path(target).parent), exist_ok=True)
                         self.check_update(
                             process_name, source, target, related_processes
@@ -193,10 +216,6 @@ class AutoDeploy:
             if Tools.kill(process_name):
                 sleep(5)  # Wait for process to terminate and release handles
 
-        if "arkview" in process_name.lower():
-            if Tools.kill("ASVExport.exe"):
-                sleep(1)
-
         for proc in related_processes:
             if Tools.is_running(proc):
                 log.info(f"Killing related process {proc}")
@@ -204,6 +223,7 @@ class AutoDeploy:
                     sleep(1)
 
         tmp_path = Path(target).with_suffix(".tmp")
+        replaced = False
         try:
             with open(source, "rb") as src_file:
                 with open(tmp_path, "wb") as target_file:
@@ -216,24 +236,35 @@ class AutoDeploy:
                 tries += 1
                 try:
                     os.replace(tmp_path, target)
+                    replaced = True
                     break
                 except (PermissionError, OSError, IOError):
                     log.debug("Something is accessing the target file, waiting...")
-                    if Tools.kill(process_name):
-                        sleep(3)
+                    # Best-effort: kill the holder if it's our process, then
+                    # always back off. The lock may be held by antivirus or an
+                    # SMB oplock that no kill releases, so the sleep must not be
+                    # conditional on kill succeeding.
+                    Tools.kill(process_name)
+                    sleep(3)
 
         except Exception as e:
             log.error(f"Failed to update {target} from {source}", exc_info=e)
+
+        if not replaced:
+            log.error(
+                f"Could not replace {target} after multiple attempts; will retry next cycle."
+            )
             if tmp_path.exists():
                 try:
                     tmp_path.unlink(missing_ok=True)
                 except Exception as e:
                     log.error(f"Failed to remove temporary file {tmp_path}", exc_info=e)
+            return
 
         if (
             not Tools.is_running(process_name)
             and "arkwipe" not in str(target).lower()
-            and target.endswith(".exe")
+            and target.lower().endswith(".exe")
         ):
             if Tools.is_unc_path(target):
                 log.warning("Target file is on a UNC path, cannot start process.")

@@ -61,6 +61,9 @@ class Tools:
     @staticmethod
     def is_running(process: str) -> bool:
         """Check if a process is running using tasklist."""
+        if not process:
+            # Empty name is a substring of every tasklist output -> false match.
+            return False
         try:
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -75,12 +78,18 @@ class Tools:
 
     @staticmethod
     def kill(process: str) -> bool:
-        """Find and kill all processes matching the given name using taskkill."""
+        """Find and kill all processes matching the given name using taskkill.
+
+        ``/T`` also terminates child processes, so helpers spawned by the target
+        (e.g. ASVExport.exe under ArkViewer.exe) get cleaned up too.
+        """
+        if not process:
+            return False
         try:
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             subprocess.check_call(
-                ["taskkill", "/F", "/IM", process],
+                ["taskkill", "/F", "/T", "/IM", process],
                 startupinfo=startupinfo,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
