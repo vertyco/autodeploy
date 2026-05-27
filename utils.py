@@ -1,83 +1,112 @@
 import hashlib
 import logging
+import os
+import subprocess
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from time import perf_counter, sleep
-from typing import Optional
-
-import colorama
-import psutil
-from colorama import Back, Fore, Style
 
 log = logging.getLogger("autodeploy.utils")
 
 
-class PrettyFormatter(logging.Formatter):
-    colorama.init(autoreset=True)
-    fmt = "%(asctime)s - %(levelname)s - %(message)s"
-    formats = {
-        logging.DEBUG: Fore.LIGHTGREEN_EX + Style.BRIGHT + fmt,
-        logging.INFO: Fore.LIGHTWHITE_EX + Style.BRIGHT + fmt,
-        logging.WARNING: Fore.YELLOW + Style.BRIGHT + fmt,
-        logging.ERROR: Fore.LIGHTMAGENTA_EX + Style.BRIGHT + fmt,
-        logging.CRITICAL: Fore.LIGHTYELLOW_EX + Back.RED + Style.BRIGHT + fmt,
-    }
-
-    def format(self, record):
-        log_fmt = self.formats.get(record.levelno)
-        formatter = logging.Formatter(fmt=log_fmt, datefmt="%m/%d %I:%M:%S %p")
-        return formatter.format(record)
-
-
 class LogFormatter(logging.Formatter):
-    def format(self, record):
-        log_fmt = "%(asctime)s - %(levelname)s - %(message)s"
-        formatter = logging.Formatter(fmt=log_fmt, datefmt="%m/%d %I:%M:%S %p")
-        return formatter.format(record)
+    def __init__(self):
+        super().__init__(fmt="%(asctime)s - %(levelname)s - %(message)s", datefmt="%m/%d %I:%M:%S %p")
+
+
+class SafeRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler resilient to SMB / network-share file-handle issues.
+
+    When the executable runs directly from a NAS path, the log file stream can
+    go stale due to SMB oplock breaks, brief network interruptions, or
+    concurrent access from other machines.  The stdlib handler crashes with
+    ``OSError: [Errno 22] Invalid argument`` when it calls seek()/tell() on a
+    stale handle during ``shouldRollover()``, or when the rename chain in
+    ``doRollover()`` fails.
+
+    This subclass:
+    * catches ``OSError`` in ``emit()`` and re-opens the stream once,
+    * wraps ``doRollover()`` so a failed rotation doesn't kill the logger.
+    """
+
+    def _reopen_stream(self):
+        """Close the current stream (ignoring errors) and open a fresh one."""
+        try:
+            if self.stream:
+                self.stream.close()
+        except OSError:
+            pass
+        self.stream = self._open()
+
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except OSError:
+            self._reopen_stream()
+            try:
+                super().emit(record)
+            except OSError:
+                self.handleError(record)
+
+    def doRollover(self):
+        """Attempt rotation, but fall back to truncation if renames fail over SMB."""
+        try:
+            super().doRollover()
+        except OSError:
+            # Rotation rename chain failed — just reopen the file to keep logging
+            self._reopen_stream()
 
 
 class Tools:
     @staticmethod
     def is_running(process: str) -> bool:
-        """Check if a process is running"""
-        running = [p.name().lower() for p in psutil.process_iter()]
-        return process.lower() in running
+        """Check if a process is running using tasklist."""
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            output = subprocess.check_output(
+                ["tasklist", "/FI", f"IMAGENAME eq {process}"],
+                startupinfo=startupinfo,
+                stderr=subprocess.STDOUT,
+            ).decode(errors="ignore")
+            return process.lower() in output.lower()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
 
     @staticmethod
     def kill(process: str) -> bool:
-        while True:
-            try:
-                for p in psutil.process_iter():
-                    if p.name().lower() == process.lower():
-                        p.kill()
-                        return True
-                return False
-            except Exception as e:
-                log.warning(f"Failed to kill process {process}: {e}")
-                sleep(1)
-
-    @staticmethod
-    def get_proc_path(process: str) -> Optional[Path]:
-        for p in psutil.process_iter():
-            try:
-                path = Path(p.cwd())
-            except Exception:
-                continue
-            name = p.name()
-            if name == process:
-                return path
+        """Find and kill all processes matching the given name using taskkill."""
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            subprocess.check_call(
+                ["taskkill", "/F", "/IM", process],
+                startupinfo=startupinfo,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
 
     @staticmethod
     def file_hash(path: Path | str, algo="sha256") -> str:
         """Compute the hash of a file."""
-        h = hashlib.new(algo)
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                h.update(chunk)
-        return h.hexdigest()
+        try:
+            h = hashlib.new(algo)
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except (IOError, FileNotFoundError):
+            log.error(f"Could not read file for hashing: {path}")
+            return ""
 
     @staticmethod
-    def wait_until_file_lock_released(file_path: Path, timeout: int = 60) -> bool:
+    def wait_until_file_lock_released(file_path: Path | str, timeout: int = 60) -> bool:
         """Wait until the file lock is released."""
+        if not os.path.exists(file_path):
+            return True
         start_time = perf_counter()
         while True:
             try:
@@ -99,6 +128,6 @@ class Tools:
 
 class Const:
     defaults = {
-        "arkviewer": '"ArkViewer.exe", "Path/To/Source/File", "Path/To/Target/File"',
+        "arkviewer": '"ArkViewer.exe", "Path/To/Source/File", "Path/To/Target/File", "ASVExport.exe"',
         "arkhandler": '"ArkHandler.exe", "Path/To/Source/File", "Path/To/Target/File"',
     }
