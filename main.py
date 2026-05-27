@@ -8,7 +8,7 @@ import subprocess
 import sys
 from configparser import ConfigParser
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 
 from utils import (
     Const,
@@ -29,6 +29,14 @@ else:
 HOSTNAME = os.getenv("COMPUTERNAME") or os.getenv("HOSTNAME")
 CONFIG_PATH = ROOT_DIR / "config.ini"
 PARSER = ConfigParser(interpolation=None)
+
+# Polling cadence. The cheap per-cycle probe is just a file-size stat (a
+# metadata round-trip, ~no bytes over SMB), so we can poll fast for low
+# detection latency. The expensive tail-signature read only runs on a "deep"
+# cycle (catches a rebuild that kept the same size) or when the size changed.
+IDLE_POLL = 2.0  # seconds between probes when nothing changed
+ACTIVE_POLL = 1.0  # poll faster right after a deploy to catch follow-up writes
+DEEP_INTERVAL = 30.0  # seconds between full tail-signature verifications
 
 red = lambda text: f"\033[91m{text}\033[0m"  # noqa
 blue = lambda text: f"\033[94m{text}\033[0m"  # noqa
@@ -104,8 +112,15 @@ class AutoDeploy:
 
     def update_checker(self):
         global PARSER
+        last_deep = 0.0
         while True:
-            sleep(5)
+            now = monotonic()
+            # A "deep" cycle reads the full tail signature to catch a same-size
+            # rebuild; ordinary cycles only stat the size (cheap over SMB).
+            deep = (now - last_deep) >= DEEP_INTERVAL
+            if deep:
+                last_deep = now
+            changed = False
             try:
                 # Only re-parse config when the file has changed
                 try:
@@ -155,9 +170,10 @@ class AutoDeploy:
                         # Parent exists again: re-arm the warning if it vanishes later.
                         self.skipped.discard(app_name)
                         os.makedirs(str(Path(target).parent), exist_ok=True)
-                        self.check_update(
-                            process_name, source, target, related_processes
-                        )
+                        if self.check_update(
+                            process_name, source, target, related_processes, deep
+                        ):
+                            changed = True
                     except Exception as e:
                         log.error(f"Error processing {app_name}", exc_info=e)
                         continue
@@ -167,32 +183,60 @@ class AutoDeploy:
                 )
             except Exception as e:
                 log.error("An unexpected error occurred", exc_info=e)
-            sleep(60)
+            # Poll faster right after a deploy (chained writes often follow),
+            # otherwise settle back to the idle cadence.
+            sleep(ACTIVE_POLL if changed else IDLE_POLL)
 
     def check_update(
-        self, process_name: str, source: str, target: str, related_processes: list[str]
-    ):
-        # Cheap change signature: (size, hash of the file tail). For a
-        # PyInstaller exe the appended archive + TOC + cookie live at the tail,
-        # so a rebuild changes this without reading the whole file over the
-        # network. mtime is deliberately ignored (unreliable over SMB).
+        self,
+        process_name: str,
+        source: str,
+        target: str,
+        related_processes: list[str],
+        deep: bool,
+    ) -> bool:
+        """Deploy source -> target if it changed. Returns True if it deployed."""
+        # Cheap probe: just the source size (a stat, ~no bytes over SMB).
+        try:
+            cur_size = os.path.getsize(source)
+        except OSError:
+            return False
+
+        known = self.deployed_sig.get(target)
+        # If the size still matches what we last deployed, skip the expensive
+        # tail read -- except on a deep cycle, which catches a same-size rebuild.
+        if known is not None and cur_size == known[0] and not deep:
+            return False
+
+        # Full change signature: (size, hash of the file tail). For a PyInstaller
+        # exe the appended archive + TOC + cookie live at the tail, so a rebuild
+        # changes this. mtime is deliberately ignored (unreliable over SMB).
         source_sig = Tools.tail_signature(source)
         if source_sig is None:
             # Source unreadable this cycle; skip and try again next loop.
-            return
+            return False
 
-        known = self.deployed_sig.get(target)
         if known is None:
             # First time we've seen this target this run: read the target once
             # to learn its state, so a restart doesn't redeploy everything.
             if Tools.tail_signature(target) == source_sig:
                 self.deployed_sig[target] = source_sig
-                return
+                return False
         elif known == source_sig:
-            # Already deployed this version; no target read needed.
-            return
+            # Already deployed this version.
+            return False
 
-        Tools.wait_until_file_lock_released(target)
+        # A change is suspected. Wait for the writer (usually another machine)
+        # to finish before copying, then re-read the settled signature.
+        if not Tools.wait_until_stable(source):
+            log.warning(f"{source} still changing; will retry next cycle.")
+            return False
+        source_sig = Tools.tail_signature(source)
+        if source_sig is None:
+            return False
+        if known is not None and known == source_sig:
+            # Settled back to what we already deployed (e.g. a mid-write blip).
+            return False
 
         log.info(f"Updating {process_name} from {source}!")
         if Tools.is_running(process_name):
@@ -243,7 +287,7 @@ class AutoDeploy:
                     tmp_path.unlink(missing_ok=True)
                 except Exception as e:
                     log.error(f"Failed to remove temporary file {tmp_path}", exc_info=e)
-            return
+            return False
 
         if (
             not Tools.is_running(process_name)
@@ -266,6 +310,7 @@ class AutoDeploy:
         # Target now equals source byte-for-byte, so record the source
         # signature as deployed -- no need to re-read the target.
         self.deployed_sig[target] = source_sig
+        return True
 
 
 if __name__ == "__main__":

@@ -174,20 +174,43 @@ class Tools:
             return None
 
     @staticmethod
-    def wait_until_file_lock_released(file_path: Path | str, timeout: int = 60) -> bool:
-        """Wait until the file lock is released."""
-        if not os.path.exists(file_path):
-            return True
-        start_time = perf_counter()
+    def wait_until_stable(
+        path: Path | str,
+        timeout: float = 60.0,
+        poll: float = 0.5,
+        stable_reads: int = 3,
+    ) -> bool:
+        """Wait until a file has finished being written.
+
+        Returns ``True`` once the size is unchanged across ``stable_reads``
+        consecutive polls AND the file opens for reading. The writer is usually
+        on another machine over SMB, where its lock state isn't visible to us --
+        size stability is the reliable signal that the write has stopped.
+        Returns ``False`` on timeout (caller should skip and retry next cycle).
+        """
+        start = perf_counter()
+        last_size = -1
+        streak = 0
         while True:
             try:
-                with open(file_path, "rb"):
-                    return True
-            except (IOError, PermissionError):
-                if perf_counter() - start_time > timeout:
-                    log.error(f"Timeout waiting for file lock on {file_path}")
-                    return False
-            sleep(0.1)
+                size = os.path.getsize(path)
+            except OSError:
+                size = -1
+            if size >= 0 and size == last_size:
+                streak += 1
+                if streak >= stable_reads:
+                    try:
+                        with open(path, "rb"):
+                            return True
+                    except (IOError, OSError):
+                        streak = 0  # still locked by the writer; keep waiting
+            else:
+                streak = 0
+                last_size = size
+            if perf_counter() - start > timeout:
+                log.error(f"Timeout waiting for {path} to stop changing")
+                return False
+            sleep(poll)
 
     @staticmethod
     def is_unc_path(path: Path | str) -> bool:
